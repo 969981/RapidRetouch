@@ -1,0 +1,207 @@
+name: Sync upstream and auto-release
+
+# Tracks https://github.com/crispin81/RapidRetouch (master).
+# All writes from the sync job are performed with GITHUB_TOKEN, so they
+# intentionally do not start additional push/tag workflows.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Build a fresh release even if upstream has not changed'
+        required: false
+        type: boolean
+        default: false
+  # Bootstrap the first build when this workflow is added/changed.
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rapidretouch-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.sync.outputs.should_release }}
+      tag: ${{ steps.sync.outputs.tag }}
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream and sync only when it changed
+        id: sync
+        shell: bash
+        env:
+          FORCE_RELEASE: ${{ inputs.force_release || 'false' }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/crispin81/RapidRetouch.git
+          git fetch --no-tags upstream master
+          upstream_sha="$(git rev-parse refs/remotes/upstream/master)"
+          echo "Upstream master: $upstream_sha"
+          changed=false
+
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            # Preserve this fork's CI files and local commits rather than
+            # hard-resetting to upstream. Conflicts stop the job safely.
+            git merge --no-ff --no-edit "$upstream_sha"
+            git push origin HEAD:master
+            changed=true
+          fi
+
+          if [[ "$changed" != true && "$FORCE_RELEASE" != true && "$GITHUB_EVENT_NAME" != push ]]; then
+            echo 'Upstream is unchanged; no build or release needed.'
+            echo 'should_release=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          source_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          version="$(python3 -c "import json; print(json.load(open('package.json', encoding='utf-8'))['version'])")"
+          tag="v${version}-sync.${short_sha}"
+
+          # Manual force builds use a distinct tag, keeping previous assets
+          # immutable and allowing retries after a failed CI run.
+          if [[ "$FORCE_RELEASE" == true && "$changed" != true ]]; then
+            tag="v${version}-manual.${short_sha}.${GITHUB_RUN_ID}"
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists."
+          else
+            git tag -a "$tag" "$source_sha" -m "RapidRetouch $tag (upstream $upstream_sha)"
+            git push origin "refs/tags/$tag"
+          fi
+
+          {
+            echo 'should_release=true'
+            echo "tag=$tag"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Preparing release $tag from $source_sha"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Match the upstream release workflow (macOS is Apple Silicon only).
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: '--target aarch64-apple-darwin'
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: ''
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ''
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.tag }}
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential rpm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Fetch uv for bundling the Python AI engine
+        shell: bash
+        run: bash scripts/fetch-uv.sh ${{ matrix.target }}
+
+      - name: Install upstream patched linuxdeploy GTK hook
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          mkdir -p ~/.cache/tauri
+          cp .github/appimage/linuxdeploy-plugin-gtk.sh ~/.cache/tauri/linuxdeploy-plugin-gtk.sh
+          chmod +x ~/.cache/tauri/linuxdeploy-plugin-gtk.sh
+
+      - name: Build installers and upload to draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ needs.sync.outputs.tag }}
+          releaseName: 'RapidRetouch ${{ needs.sync.outputs.tag }}'
+          releaseBody: |
+            Automatic build from crispin81/RapidRetouch master.
+            Source commit: ${{ needs.sync.outputs.source_sha }}
+            Includes the Python AI engine bootstrapper. AI dependencies/models download at first launch.
+            Installers are unsigned. See upstream README for platform-specific instructions.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json
+
+  publish:
+    needs: [sync, build]
+    if: needs.sync.outputs.should_release == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.sync.outputs.tag }}
+    steps:
+      - name: Download versioned installers and add stable aliases
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh release download "$TAG" --dir out \
+            -p '*_amd64.AppImage' \
+            -p '*_aarch64.dmg' \
+            -p '*_x64_en-US.msi' \
+            -p '*_x64-setup.exe'
+          cp out/*_amd64.AppImage out/RapidRetouch_linux_x86_64.AppImage
+          cp out/*_aarch64.dmg out/RapidRetouch_mac_apple_silicon.dmg
+          cp out/*_x64_en-US.msi out/RapidRetouch_windows_x64.msi
+          cp out/*_x64-setup.exe out/RapidRetouch_windows_x64_setup.exe
+          gh release upload "$TAG" --clobber \
+            out/RapidRetouch_linux_x86_64.AppImage \
+            out/RapidRetouch_mac_apple_silicon.dmg \
+            out/RapidRetouch_windows_x64.msi \
+            out/RapidRetouch_windows_x64_setup.exe
+
+      - name: Publish only after all platforms succeeded
+        shell: bash
+        run: gh release edit "$TAG" --draft=false --latest
+
+      - name: Summarize release
+        shell: bash
+        run: |
+          echo "### RapidRetouch published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release: https://github.com/$GH_REPO/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --json assets --jq '.assets[].name' >> "$GITHUB_STEP_SUMMARY"
